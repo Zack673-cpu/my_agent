@@ -1,1 +1,1 @@
-"""Nano Banana 2 Lite 图片合成智能体。"""
+"""Qwen-Image 双模型图片编辑智能体。"""
