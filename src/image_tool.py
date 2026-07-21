@@ -18,12 +18,16 @@ import os
 import time
 from http import HTTPStatus
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import requests
 from dashscope import MultiModalConversation
 
 # 阿里百炼 - 千问图像生成与编辑模型 ID
 DASHSCOPE_MODEL = "qwen-image-2.0-pro"
+
+# 阿里百炼 - 千问多模态视觉理解模型 ID（智能体的“眼睛与大脑”）
+DASHSCOPE_VL_MODEL = "qwen3.7-plus"
 
 # 硅基流动 - 千问图像编辑模型 ID
 SILICONFLOW_MODEL = "Qwen/Qwen-Image-Edit-2509"
@@ -104,6 +108,55 @@ def _encode_image(path: str) -> str:
     return f"data:{mime};base64,{data}"
 
 
+# 支持的图片扩展名（用于从 URL / Content-Type 推断时做校验）
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
+def _sniff_image_ext(content: bytes) -> str | None:
+    """根据文件头魔术字节判断真实图片格式，返回扩展名或 None。"""
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return ".webp"
+    if content[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if content[:2] == b"BM":
+        return ".bmp"
+    return None
+
+
+def _guess_ext(url: str, content_type: str, content: bytes) -> str:
+    """综合 URL 后缀、Content-Type、文件头魔术字节推断图片扩展名。
+
+    硅基流动等服务返回的 URL Content-Type 常为 application/octet-stream，
+    直接用 mimetypes.guess_extension 会得到 .bin，导致文件打不开。
+    """
+    # 1. URL 路径中的扩展名（去掉查询参数）
+    url_ext = Path(unquote(urlsplit(url).path)).suffix.lower()
+    if url_ext in _IMAGE_EXTS:
+        return ".jpg" if url_ext == ".jpeg" else url_ext
+
+    # 2. Content-Type（排除通用二进制类型）
+    if content_type and content_type != "application/octet-stream":
+        ct_ext = mimetypes.guess_extension(content_type)
+        if ct_ext:
+            ct_ext = ct_ext.lower()
+            if ct_ext in (".jpe", ".jpeg"):
+                ct_ext = ".jpg"
+            if ct_ext in _IMAGE_EXTS:
+                return ct_ext
+
+    # 3. 文件头嗅探真实格式
+    sniffed = _sniff_image_ext(content)
+    if sniffed:
+        return sniffed
+
+    # 4. 兜底
+    return ".png"
+
+
 def _save_url(url: str) -> str:
     """下载远程图片 URL 并保存到 outputs/，返回本地路径。
 
@@ -117,8 +170,8 @@ def _save_url(url: str) -> str:
     except Exception as exc:  # noqa: BLE001
         raise ImageToolError(f"下载生成图片失败：{exc}") from exc
 
-    content_type = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
-    ext = mimetypes.guess_extension(content_type) or ".png"
+    content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+    ext = _guess_ext(url, content_type, resp.content)
     filename = f"qwen_{int(time.time() * 1000)}_{os.urandom(3).hex()}{ext}"
     out_path = OUTPUT_DIR / filename
     out_path.write_bytes(resp.content)
@@ -138,6 +191,78 @@ def _extract_dashscope_urls(response) -> list[str]:
             if image:
                 urls.append(image)
     return urls
+
+
+def _extract_dashscope_text(response) -> str:
+    """从 DashScope 多模态响应中提取纯文本内容（用于视觉理解模型）。"""
+    texts: list[str] = []
+    output = _attr(response, "output")
+    choices = _attr(output, "choices") or []
+    for choice in choices:
+        message = _attr(choice, "message")
+        content = _attr(message, "content")
+        if isinstance(content, str):
+            texts.append(content)
+            continue
+        for item in content or []:
+            text = _attr(item, "text")
+            if text:
+                texts.append(text)
+    return "\n".join(texts).strip()
+
+
+def understand_with_dashscope(
+    image_paths: list[str],
+    prompt: str,
+    system: str | None = None,
+    model: str = DASHSCOPE_VL_MODEL,
+) -> str:
+    """用阿里百炼 qwen3.7-plus 看图并返回文本，作为智能体的感知与推理能力。
+
+    Args:
+        image_paths: 参与理解的图片本地路径（可为空，表示纯文本推理）。
+        prompt: 提给视觉模型的问题 / 指令。
+        system: 可选的系统提示词，用于设定模型角色与输出格式。
+        model: 视觉理解模型 ID，默认 qwen3.7-plus。
+
+    Returns:
+        模型返回的文本内容。
+    """
+    if not prompt or not prompt.strip():
+        raise ImageToolError("提示词不能为空。")
+    if len(image_paths) > MAX_INPUT_IMAGES:
+        raise ImageToolError(
+            f"输入图片过多（{len(image_paths)} 张），最多支持 {MAX_INPUT_IMAGES} 张。"
+        )
+    api_key = _get_dashscope_key()
+
+    content: list[dict] = [{"image": _encode_image(p)} for p in image_paths]
+    content.append({"text": prompt})
+    messages: list[dict] = []
+    if system and system.strip():
+        messages.append({"role": "system", "content": [{"text": system}]})
+    messages.append({"role": "user", "content": content})
+
+    try:
+        response = MultiModalConversation.call(
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            stream=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ImageToolError(f"调用 {model} 失败：{exc}") from exc
+
+    if _attr(response, "status_code") != HTTPStatus.OK:
+        raise ImageToolError(
+            f"{model} 返回错误："
+            f"{_attr(response, 'code')} {_attr(response, 'message')}"
+        )
+
+    text = _extract_dashscope_text(response)
+    if not text:
+        raise ImageToolError(f"{model} 没有返回文本，请稍后重试。")
+    return text
 
 
 def edit_with_dashscope(
