@@ -3,9 +3,11 @@
 输入固定为「一组图片 + 提示词」，两个模型都执行图像编辑：
 
 - 阿里百炼 DashScope：Qwen-Image-2.0-Pro（qwen-image-2.0-pro），生成+编辑
-  融合模型，图片以 base64 data URI 放入 messages 内容。
-- 硅基流动 SiliconFlow：Qwen/Qwen-Image-Edit-2509，图片放入 image/image2/
-  image3 字段。
+  融合模型，图片以 file:// 本地路径放入 messages，由 SDK 自动上传到
+  临时 OSS（单文件最大 100MB，与百炼平台页面上传行为一致）。
+- 硅基流动 SiliconFlow：Qwen/Qwen-Image-Edit-2509，图片以原图 base64 直传
+  放入 image/image2/image3 字段，不做任何压缩（实测网关可接受至少
+  155MB 的请求体）。
 
 模型的选择与自动降级逻辑在 agent.py 中编排，本模块只负责各自的 API 调用。
 """
@@ -44,8 +46,62 @@ MAX_INPUT_IMAGES = 3
 # 两个模型单次都最多输出 6 张
 MAX_OUTPUT_IMAGES = 6
 
+# 百炼 Qwen-Image-2.0-Pro 模型侧的单图输入上限（服务端硬限制，
+# 与上传通道无关）。超过时服务端报 InvalidParameter，本地提前拦截
+# 可省去一次无意义的上传，让 auto 模式立即降级到硅基流动。
+_DASHSCOPE_EDIT_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
 # 网络请求超时（秒）。图像生成耗时较长，给足余量。
 REQUEST_TIMEOUT = 300
+
+# 瞬时网络错误（SSL 握手中断 / 连接重置 / 超时等）的自动重试配置。
+# 这类错误重试往往即可成功，因此在真正抛错前先自动重试几次。
+_NETWORK_MAX_ATTEMPTS = 3
+_NETWORK_BACKOFF = 2  # 秒，退避基数，第 n 次失败后等待 n * 基数 秒再重试
+
+
+def _is_transient_network_error(exc: Exception) -> bool:
+    """判断异常是否为可重试的瞬时网络错误（SSL EOF / 连接重置 / 超时等）。"""
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.SSLError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ),
+    ):
+        return True
+    text = str(exc).lower()
+    keywords = (
+        "ssleoferror",
+        "eof occurred",
+        "max retries exceeded",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "_ssl.c",
+    )
+    return any(k in text for k in keywords)
+
+
+def _call_with_retry(func, *args, **kwargs):
+    """对可能遭遇瞬时网络错误的调用做自动重试（指数退避）。
+
+    仅对瞬时网络错误重试；其它错误（如鉴权失败、参数错误）立即抛出，
+    避免无意义的等待。
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _NETWORK_MAX_ATTEMPTS + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < _NETWORK_MAX_ATTEMPTS and _is_transient_network_error(exc):
+                time.sleep(_NETWORK_BACKOFF * attempt)
+                continue
+            raise
+    assert last_exc is not None  # 理论上不可达
+    raise last_exc
 
 
 class ImageToolError(RuntimeError):
@@ -93,8 +149,26 @@ def _validate_inputs(image_paths: list[str], prompt: str) -> None:
         )
 
 
+def _to_file_uri(path: str) -> str:
+    """把本地图片路径转成 file:// URI，交给 DashScope SDK 上传到临时 OSS。
+
+    大图以 base64 塞进请求体会超过 API 网关的请求体限制，导致连接在
+    传输中被掐断（SSLEOFError）。file:// 走 SDK 内置的 OSS 上传通道，
+    单文件最大 100MB，与百炼平台页面上传的行为一致。
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise ImageToolError(f"找不到图片文件：{path}")
+    return p.resolve().as_uri()
+
+
 def _encode_image(path: str) -> str:
-    """把本地图片编码成 data URI（data:{mime};base64,{data}）。"""
+    """把本地图片原图编码成 data URI（data:{mime};base64,{data}）。
+
+    不做任何压缩，保证送到模型的图片与用户上传的字节完全一致。
+    实测硅基流动网关可接受至少 155MB 的 base64 请求体；若图片像素数
+    过高（实测约 1.9 亿像素），模型侧会处理失败返回 HTTP 500。
+    """
     p = Path(path)
     if not p.is_file():
         raise ImageToolError(f"找不到图片文件：{path}")
@@ -165,7 +239,7 @@ def _save_url(url: str) -> str:
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        resp = _call_with_retry(requests.get, url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
         raise ImageToolError(f"下载生成图片失败：{exc}") from exc
@@ -236,7 +310,7 @@ def understand_with_dashscope(
         )
     api_key = _get_dashscope_key()
 
-    content: list[dict] = [{"image": _encode_image(p)} for p in image_paths]
+    content: list[dict] = [{"image": _to_file_uri(p)} for p in image_paths]
     content.append({"text": prompt})
     messages: list[dict] = []
     if system and system.strip():
@@ -244,7 +318,8 @@ def understand_with_dashscope(
     messages.append({"role": "user", "content": content})
 
     try:
-        response = MultiModalConversation.call(
+        response = _call_with_retry(
+            MultiModalConversation.call,
             api_key=api_key,
             model=model,
             messages=messages,
@@ -283,15 +358,25 @@ def edit_with_dashscope(
         生成图片的本地路径列表。
     """
     _validate_inputs(image_paths, prompt)
+    # 本地前置校验：超过模型 10MB 硬限制的图直接快速失败，
+    # 不浪费上传和 API 调用，auto 模式会立即降级到硅基流动（原图直传）。
+    for p in image_paths:
+        file_bytes = Path(p).stat().st_size if Path(p).is_file() else 0
+        if file_bytes > _DASHSCOPE_EDIT_MAX_IMAGE_BYTES:
+            raise ImageToolError(
+                f"图片 {Path(p).name}（{file_bytes / 1048576:.1f}MB）超过 "
+                "Qwen-Image-2.0-Pro 模型的单图 10MB 输入上限"
+            )
     num_outputs = max(1, min(MAX_OUTPUT_IMAGES, int(num_outputs)))
     api_key = _get_dashscope_key()
 
-    content: list[dict] = [{"image": _encode_image(p)} for p in image_paths]
+    content: list[dict] = [{"image": _to_file_uri(p)} for p in image_paths]
     content.append({"text": prompt})
     messages = [{"role": "user", "content": content}]
 
     try:
-        response = MultiModalConversation.call(
+        response = _call_with_retry(
+            MultiModalConversation.call,
             api_key=api_key,
             model=DASHSCOPE_MODEL,
             messages=messages,
@@ -357,7 +442,8 @@ def edit_with_siliconflow(
     saved_paths: list[str] = []
     for _ in range(num_outputs):
         try:
-            resp = requests.post(
+            resp = _call_with_retry(
+                requests.post,
                 SILICONFLOW_URL,
                 json=payload,
                 headers=headers,

@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI 绘本工坊 · 绘本智能体</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- 全局背景装饰：渐变光斑 + 网格 -->
+  <div class="backdrop">
+    <div class="orb orb-a"></div>
+    <div class="orb orb-b"></div>
+    <div class="grid-layer"></div>
+  </div>
+
+  <!-- ============ 阶段一 · 欢迎页 ============ -->
+  <section id="stage-welcome" class="stage active">
+    <div class="welcome-inner">
+      <p class="eyebrow">AI STORYBOOK AGENT</p>
+      <h1 class="headline">欢迎来到 <span class="grad-text">AI 绘本工坊</span></h1>
+      <p class="subline">读取素材 · 智能生成 · 装订成册</p>
+
+      <div class="model-switch" id="modelSwitch" role="group" aria-label="模型切换">
+        <button class="model-btn on" data-model="auto">
+          <span class="model-name">自动调度</span>
+          <span class="model-desc">百炼优先 · 失败自动切换</span>
+        </button>
+        <button class="model-btn" data-model="bailian">
+          <span class="model-name">阿里百炼</span>
+          <span class="model-desc">Qwen-Image-2.0-Pro</span>
+        </button>
+        <button class="model-btn" data-model="siliconflow">
+          <span class="model-name">硅基流动</span>
+          <span class="model-desc">Qwen-Image-Edit-2509</span>
+        </button>
+      </div>
+
+      <button id="btnLaunch" class="btn-launch">
+        <span class="btn-launch-glow"></span>
+        启 动
+      </button>
+    </div>
+  </section>
+
+  <!-- ============ 阶段二 · 读取素材 ============ -->
+  <section id="stage-loading" class="stage">
+    <div class="loading-inner" id="loadingView">
+      <div class="scan-ring">
+        <div class="scan-ring-core"></div>
+      </div>
+      <p class="loading-text">正在读取文件中<span class="dots"><i>.</i><i>.</i><i>.</i></span></p>
+    </div>
+    <div class="loading-error hidden" id="loadingError">
+      <p class="error-icon">!</p>
+      <p class="error-text" id="loadingErrorText"></p>
+      <button class="btn-ghost" id="btnBackHome">返回首页</button>
+    </div>
+  </section>
+
+  <!-- ============ 阶段三 · 生成控制台 ============ -->
+  <section id="stage-console" class="stage">
+    <div class="console-inner">
+      <header class="console-head">
+        <div class="console-title">
+          <span class="pulse-dot"></span>
+          智能体运行中
+        </div>
+        <div class="console-meta">
+          <span class="meta-chip" id="chipProgress">第 1 / 1 张</span>
+          <span class="meta-chip" id="chipModel">自动调度</span>
+        </div>
+      </header>
+
+      <!-- 逐张任务的时间线，任务卡片由 JS 依次追加 -->
+      <div class="timeline" id="timeline"></div>
+
+      <!-- 任务类型询问卡片 -->
+      <div class="ask-card hidden" id="askCard">
+        <p class="ask-title" id="askTitle">第 1 张 · 选择任务类型</p>
+        <p class="ask-sub" id="askSub">背景：背景图（一）</p>
+        <!-- 本次待传素材预览：背景图 + 人物图 -->
+        <div class="ask-preview">
+          <figure class="ask-thumb">
+            <img id="askBgImg" alt="本次背景图" />
+            <figcaption id="askBgName">背景图</figcaption>
+          </figure>
+          <span class="ask-plus">＋</span>
+          <figure class="ask-thumb">
+            <img id="askPersonImg" alt="人物参照图" />
+            <figcaption id="askPersonName">人物</figcaption>
+          </figure>
+        </div>
+        <textarea id="askExtra" class="ask-extra" rows="2"
+          placeholder="可选：补充这一张的额外要求，例如“躲在树后探出头”，留空则由智能体自行安排"></textarea>
+        <div class="ask-actions">
+          <button class="btn-task btn-task-real" id="btnTaskReal">
+            <span class="task-name">真人融合</span>
+            <span class="task-desc">真人自然融入背景</span>
+          </button>
+          <button class="btn-task btn-task-toon" id="btnTaskToon">
+            <span class="task-name">卡通形象</span>
+            <span class="task-desc">卡通化并保留本人特征</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 阶段四 · 儿童绘本 ============ -->
+  <section id="stage-book" class="stage">
+    <div class="book-hall">
+      <p class="book-caption">你的专属绘本已装订完成 · 点击右页向后翻，点击左页向前翻</p>
+      <div class="book-scene">
+        <div class="book" id="book"><!-- 书页由 JS 生成 --></div>
+      </div>
+      <p class="scroll-hint">继续下滑<span class="scroll-arrow">↓</span></p>
+    </div>
+    <div class="book-footer">
+      <p class="footer-text">对这一册不满意？可以推倒重来，之前的生成结果将作废。</p>
+      <button class="btn-regen" id="btnRegen">重新生成</button>
+    </div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

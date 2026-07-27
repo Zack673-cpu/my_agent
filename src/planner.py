@@ -10,16 +10,21 @@
     4. 反思（critique）：再看结果，判断是否换脸/拼贴/遮挡不当/特征丢失，
        不合格则给出修改建议并自动重试。
 
-这条「看图—生成—看结果—修正」的闭环，是本项目体现「智能体」的核心。
+这四步由 ``workflow.py`` 的轻量工作流引擎驱动：每一步是一个显式的节点（Step），
+质检不合格时通过「质检 → 出图」的回边形成重试循环。
+这条「看图—生成—看结果—修正」的闭环工作流，是本项目体现「智能体」的核心。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+from typing import Iterator
 
 from .agent import run_edit
 from .image_tool import ImageToolError, understand_with_dashscope
+from .workflow import END, Step, StepEvent, Workflow, WorkflowContext
 
 # 两种任务类型
 TASK_REALISTIC = "realistic_fusion"
@@ -82,13 +87,49 @@ def _safe_json(text: str) -> dict:
         return {}
 
 
+# 文件名约定：包含「背景」视为背景图，包含「人物」视为人物参考图
+_ROLE_LABELS = {"person": "人物", "background": "背景图"}
+
+
+def _filename_roles(image_paths: list[str]) -> dict[int, str]:
+    """按文件名约定识别每张图的角色：{序号(从1起): "person"/"background"}。"""
+    roles: dict[int, str] = {}
+    for i, path in enumerate(image_paths, start=1):
+        name = os.path.basename(path)
+        if "背景" in name:
+            roles[i] = "background"
+        elif "人物" in name:
+            roles[i] = "person"
+    return roles
+
+
 def perceive(image_paths: list[str]) -> dict:
-    """看图并返回结构化感知结果（人物特征 / 背景元素 / 光线 / 遮挡物）。"""
+    """看图并返回结构化感知结果（人物特征 / 背景元素 / 光线 / 遮挡物）。
+
+    若文件名符合「背景图 / 人物」约定，则以文件名指定的角色为准，
+    既提前告知模型，也在解析后强制覆盖模型的角色判断。
+    """
+    roles = _filename_roles(image_paths)
+    user_prompt = _PERCEIVE_USER
+    if roles:
+        hint = "，".join(
+            f"第{i}张是【{_ROLE_LABELS[r]}】" for i, r in sorted(roles.items())
+        )
+        user_prompt = (
+            f"已知信息（由文件名指定，必须遵循，不要自行改判角色）：{hint}。\n\n"
+            + _PERCEIVE_USER
+        )
     raw = understand_with_dashscope(
-        image_paths, _PERCEIVE_USER, system=_PERCEIVE_SYSTEM
+        image_paths, user_prompt, system=_PERCEIVE_SYSTEM
     )
     data = _safe_json(raw)
     data["_raw"] = raw
+    # 文件名指定的角色优先级最高，覆盖模型判断
+    for img in data.get("images", []) or []:
+        idx = img.get("index")
+        if idx in roles:
+            img["role"] = roles[idx]
+    data["_filename_roles"] = roles
     return data
 
 
@@ -124,14 +165,44 @@ def _plan_system(task_type: str) -> str:
     )
 
 
-def _plan_user(task_type: str, user_request: str, brief: str) -> str:
+def _role_constraints(perception: dict, task_type: str) -> str:
+    """把文件名指定的角色转成规划提示词中的强约束语句。"""
+    roles = perception.get("_filename_roles") or {}
+    lines: list[str] = []
+    for idx in sorted(roles):
+        if roles[idx] == "background":
+            lines.append(
+                f"- 第{idx}张由文件名指定为【背景图】：必须以这张图作为背景，"
+                "完整保留其场景内容与构图，严禁重绘、替换或修改背景。"
+            )
+        elif task_type == TASK_CARTOON:
+            lines.append(
+                f"- 第{idx}张由文件名指定为【人物图】：把这张图中的人物卡通化"
+                "（必须保留其最显著特征，一眼能认出是本人）后融入背景。"
+            )
+        else:
+            lines.append(
+                f"- 第{idx}张由文件名指定为【人物图】：让这张图中的真人按用户"
+                "需求做出相应动作，严格保留五官脸型，不得换脸。"
+            )
+    return "\n".join(lines)
+
+
+def _plan_user(
+    task_type: str, user_request: str, brief: str, role_constraints: str = ""
+) -> str:
     from .prompt_template import CARTOON_TEMPLATE, COMMON_TEMPLATE
 
     template = CARTOON_TEMPLATE if task_type == TASK_CARTOON else COMMON_TEMPLATE
+    role_block = (
+        f"\n【文件名指定的角色约束（最高优先级，必须严格遵循）】\n{role_constraints}\n"
+        if role_constraints
+        else ""
+    )
     return f"""\
 【用户的白话需求】
 {user_request}
-
+{role_block}
 【看图得到的信息】
 {brief}
 
@@ -150,7 +221,12 @@ def plan_prompt(task_type: str, user_request: str, perception: dict) -> str:
     brief = _perception_brief(perception)
     text = understand_with_dashscope(
         [],
-        _plan_user(task_type, user_request, brief),
+        _plan_user(
+            task_type,
+            user_request,
+            brief,
+            _role_constraints(perception, task_type),
+        ),
         system=_plan_system(task_type),
     )
     return _strip_json(text) if text.strip().startswith("```") else text.strip()
@@ -210,13 +286,147 @@ def critique(
 
 
 def _pick_person_image(image_paths: list[str], perception: dict) -> str:
-    """从感知结果里挑出人物参考图，失败则退回第一张。"""
+    """挑出人物参考图：优先文件名指定，其次感知结果，最后退回第一张。"""
+    roles = perception.get("_filename_roles") or {}
+    for idx in sorted(roles):
+        if roles[idx] == "person" and 1 <= idx <= len(image_paths):
+            return image_paths[idx - 1]
     for img in perception.get("images", []) or []:
         if img.get("role") == "person":
             idx = img.get("index")
             if isinstance(idx, int) and 1 <= idx <= len(image_paths):
                 return image_paths[idx - 1]
     return image_paths[0]
+
+
+# ---------------------------------------------------------------------------
+# 工作流节点：感知 → 规划 → 出图 → 质检（不合格时回边到出图）
+# ---------------------------------------------------------------------------
+def _step_perceive(ctx: WorkflowContext) -> tuple[str | None, str]:
+    """节点 1：看图，提取人物特征与场景信息。"""
+    ctx.log("**第 1 步 · 👁️ 感知**：正在看图，提取人物特征与场景信息……")
+    ctx.perception = perceive(ctx.image_paths)
+    roles = ctx.perception.get("_filename_roles") or {}
+    if roles:
+        ctx.log(
+            "已按文件名识别角色："
+            + "，".join(
+                f"第{i}张={_ROLE_LABELS[r]}" for i, r in sorted(roles.items())
+            )
+        )
+    brief = _perception_brief(ctx.perception)
+    ctx.log(f"感知结果：\n{brief}")
+    ctx.person_image = _pick_person_image(ctx.image_paths, ctx.perception)
+
+    # 摘要：优先用人物最显著特征一句话
+    summary = ""
+    for img in ctx.perception.get("images", []) or []:
+        if img.get("role") == "person" and img.get("distinctive_features"):
+            summary = img["distinctive_features"]
+            break
+    if not summary and brief:
+        summary = brief.split("\n")[0]
+    return None, summary
+
+
+def _step_plan(ctx: WorkflowContext) -> tuple[str | None, str]:
+    """节点 2：结合需求与感知结果自动撰写专业提示词。"""
+    ctx.log("**第 2 步 · 🧠 规划**：结合需求自动撰写专业提示词……")
+    ctx.prompt = plan_prompt(ctx.task_type, ctx.user_request, ctx.perception)
+    ctx.log(f"生成的提示词：\n```\n{ctx.prompt}\n```")
+    head = ctx.prompt.replace("\n", " ")
+    return None, head[:60] + ("…" if len(head) > 60 else "")
+
+
+def _step_generate(ctx: WorkflowContext) -> tuple[str | None, str]:
+    """节点 3：调用图像编辑模型出图。"""
+    ctx.attempt += 1
+    ctx.log(f"**第 3 步 · 🎨 出图（第 {ctx.attempt} 次尝试）**：调用图像模型生成……")
+    ctx.outputs, ctx.gen_status = run_edit(
+        ctx.image_paths, ctx.prompt, num_outputs=1, model=ctx.model
+    )
+    ctx.log(f"出图完成（{ctx.gen_status}）。")
+
+    if ctx.attempt > ctx.max_retries:
+        # 已是最后一次尝试，不再质检，直接结束
+        ctx.log("已达最大尝试次数，返回当前结果。")
+        return END, f"第 {ctx.attempt} 次尝试，{ctx.gen_status}"
+    return None, f"第 {ctx.attempt} 次尝试，{ctx.gen_status}"
+
+
+def _step_critique(ctx: WorkflowContext) -> tuple[str | None, str]:
+    """节点 4：对照原图质检；不合格则带建议回到出图节点重试。"""
+    ctx.log("**第 4 步 · 🔍 自检**：对照原图检查生成质量……")
+    ctx.review = critique(
+        ctx.task_type, ctx.user_request, ctx.person_image, ctx.outputs[0]
+    )
+    if ctx.review.get("passed"):
+        ctx.log("✅ 自检通过：结果符合要求。")
+        return END, "自检通过，结果符合要求"
+
+    issues = ctx.review.get("issues") or []
+    suggestion = ctx.review.get("suggestion") or ""
+    issue_text = "；".join(issues) if issues else "存在质量问题"
+    ctx.log(f"⚠️ 自检未通过：{issue_text}")
+    if suggestion:
+        ctx.log(f"改进建议：{suggestion}")
+        # 把建议追加进提示词后重试
+        ctx.prompt = f"{ctx.prompt}\n\n【重点修正】{suggestion}"
+    ctx.log("→ 智能体决定调整提示词并重试。")
+    return "generate", f"未通过：{issue_text}"
+
+
+# 供前端渲染状态条：(key, 展示名)
+WORKFLOW_STEPS: list[tuple[str, str]] = [
+    ("perceive", "👁️ 感知"),
+    ("plan", "🧠 规划"),
+    ("generate", "🎨 出图"),
+    ("critique", "🔍 质检"),
+]
+
+_STEP_FNS = {
+    "perceive": _step_perceive,
+    "plan": _step_plan,
+    "generate": _step_generate,
+    "critique": _step_critique,
+}
+
+
+def build_workflow() -> Workflow:
+    """构建「感知 → 规划 → 出图 → 质检（回边重试）」的工作流。"""
+    return Workflow(
+        [Step(key, label, _STEP_FNS[key]) for key, label in WORKFLOW_STEPS]
+    )
+
+
+def run_agent_stream(
+    image_paths: list[str],
+    task_type: str,
+    user_request: str,
+    model: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> Iterator[tuple[StepEvent, WorkflowContext]]:
+    """流式执行智能体工作流，逐个产出 (StepEvent, 上下文)。
+
+    前端可据此实时渲染步骤状态条与详细日志。
+    """
+    if not image_paths:
+        raise ImageToolError("没有可用的输入图片，请先上传图片。")
+    if not user_request or not user_request.strip():
+        raise ImageToolError("请用一句话描述你想要的效果。")
+
+    ctx = WorkflowContext(
+        image_paths=image_paths,
+        task_type=task_type,
+        user_request=user_request.strip(),
+        model=model,
+        max_retries=max_retries,
+    )
+    task_label = dict(TASK_CHOICES).get(task_type, task_type)
+    ctx.log(f"### 🤖 智能体开始工作（任务：{task_label}）")
+
+    for event in build_workflow().run(ctx):
+        yield event, ctx
 
 
 def run_agent(
@@ -228,61 +438,14 @@ def run_agent(
 ) -> tuple[list[str], str, str]:
     """智能体主流程，返回（最终图片路径列表, 思考过程 Markdown, 状态说明）。
 
-    流程：感知 → 规划提示词 → 出图 → 质检 → 不合格则带建议重试。
-    思考过程 Markdown 会记录每一步的推理，用于前端展示智能体的自主决策。
+    内部基于 ``run_agent_stream``：耗尽工作流事件后收敛为一次性结果，
+    保持既有调用方兼容。
     """
-    if not image_paths:
-        raise ImageToolError("没有可用的输入图片，请先上传图片。")
-    if not user_request or not user_request.strip():
-        raise ImageToolError("请用一句话描述你想要的效果。")
-
-    log: list[str] = []
-    task_label = dict(TASK_CHOICES).get(task_type, task_type)
-    log.append(f"### 🤖 智能体开始工作（任务：{task_label}）")
-
-    # 1. 感知
-    log.append("**第 1 步 · 👁️ 感知**：正在看图，提取人物特征与场景信息……")
-    perception = perceive(image_paths)
-    brief = _perception_brief(perception)
-    log.append(f"感知结果：\n{brief}")
-
-    person_image = _pick_person_image(image_paths, perception)
-
-    # 2. 规划提示词
-    log.append("**第 2 步 · 🧠 规划**：结合需求自动撰写专业提示词……")
-    prompt = plan_prompt(task_type, user_request.strip(), perception)
-    log.append(f"生成的提示词：\n```\n{prompt}\n```")
-
-    # 3~4. 出图 + 反思 + 重试
-    final_paths: list[str] = []
-    attempt = 0
-    while attempt <= max_retries:
-        attempt += 1
-        log.append(f"**第 3 步 · 🎨 出图（第 {attempt} 次尝试）**：调用图像模型生成……")
-        paths, gen_status = run_edit(image_paths, prompt, num_outputs=1, model=model)
-        log.append(f"出图完成（{gen_status}）。")
-        final_paths = paths
-
-        if attempt > max_retries:
-            log.append("已达最大尝试次数，返回当前结果。")
-            break
-
-        # 反思
-        log.append("**第 4 步 · 🔍 自检**：对照原图检查生成质量……")
-        review = critique(task_type, user_request.strip(), person_image, paths[0])
-        if review.get("passed"):
-            log.append("✅ 自检通过：结果符合要求。")
-            break
-
-        issues = review.get("issues") or []
-        suggestion = review.get("suggestion") or ""
-        issue_text = "；".join(issues) if issues else "存在质量问题"
-        log.append(f"⚠️ 自检未通过：{issue_text}")
-        if suggestion:
-            log.append(f"改进建议：{suggestion}")
-            # 把建议追加进提示词后重试
-            prompt = f"{prompt}\n\n【重点修正】{suggestion}"
-        log.append("→ 智能体决定调整提示词并重试。")
-
-    status = f"智能体已完成，共尝试 {attempt} 次。"
-    return final_paths, "\n\n".join(log), status
+    ctx: WorkflowContext | None = None
+    for _, ctx in run_agent_stream(
+        image_paths, task_type, user_request, model, max_retries
+    ):
+        pass
+    assert ctx is not None
+    status = f"智能体已完成，共尝试 {ctx.attempt} 次。"
+    return ctx.outputs, ctx.thoughts(), status

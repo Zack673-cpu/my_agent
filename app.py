@@ -1,216 +1,252 @@
-"""Gradio 网页界面：上传图片 + 提示词 + 选择模型，执行图片编辑。
+"""FastAPI 后端：为「绘本智能体」单页前端提供接口。
 
-- 默认走阿里百炼 Qwen-Image-2.0-Pro；调用失败时自动切换到硅基流动
-  Qwen-Image-Edit-2509。
-- 也可在前端手动指定使用某一个模型。
+前端是 static/ 下的纯原生单页应用，整个体验分四个阶段：
+
+1. 欢迎页：选模型 → 点启动。
+2. 读取素材：POST /api/scan 读取桌面的「背景图」「人物」两个文件夹。
+3. 生成控制台：GET /api/generate（SSE）对每张背景图跑
+   「感知 → 规划 → 出图」的精简智能体流程，逐步骤实时推送。
+4. 儿童绘本：前端把生成结果装进 3D 翻页绘本展示。
+
+后端不改动 src/ 下的任何模块，只做复用与编排。
 """
 
 from __future__ import annotations
 
-import gradio as gr
-from dotenv import load_dotenv
+import json
+import os
+import re
+from pathlib import Path
 
-from src.agent import MODEL_AUTO, MODEL_CHOICES, run_edit
-from src.image_tool import MAX_INPUT_IMAGES, ImageToolError
-from src.planner import TASK_CHOICES, run_agent
-from src.prompt_template import TEMPLATE_CHOICES, build_prompt
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from src.agent import MODEL_AUTO, MODEL_BAILIAN, MODEL_SILICONFLOW
+from src.image_tool import ImageToolError
+from src.planner import TASK_CARTOON, TASK_REALISTIC, run_agent_stream
 
 load_dotenv()
 
-# gr.Radio 的选项：(展示名, 标识)
-_RADIO_CHOICES = [(label, value) for value, label in MODEL_CHOICES]
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 
-# 提示词模板下拉：(展示名, 标识)
-_TEMPLATE_RADIO_CHOICES = [(label, value) for value, label in TEMPLATE_CHOICES]
+# 桌面素材文件夹的约定名称
+BG_FOLDER_NAME = "背景图"
+PERSON_FOLDER_NAME = "人物"
 
-# 智能体任务类型：(展示名, 标识)
-_TASK_RADIO_CHOICES = [(label, value) for value, label in TASK_CHOICES]
+# 识别为图片的扩展名
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+
+# 合法的模型 / 任务取值（防止前端传来脏数据）
+VALID_MODELS = {MODEL_AUTO, MODEL_BAILIAN, MODEL_SILICONFLOW}
+VALID_TASKS = {TASK_REALISTIC, TASK_CARTOON}
+
+# 文本框留空时，按任务类型自动补的默认白话需求
+DEFAULT_REQUESTS = {
+    TASK_REALISTIC: "让人物自然地融入这张背景，姿态动作贴合场景氛围，光影协调统一。",
+    TASK_CARTOON: "把人物卡通化后自然融入这张背景，必须保留人物最显著的特征，一眼能认出是本人。",
+}
+
+# 中文数字 → 阿拉伯数字，用于「背景图（一）（二）（三）」的排序
+_CN_NUMS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+app = FastAPI(title="绘本智能体")
+
+# 扫描结果注册表：文件 id -> 本地绝对路径。
+# 前端只拿到 id，通过 /api/file/{fid} 取图，避免把本地路径直接暴露成任意文件读取。
+_files: dict[str, str] = {}
 
 
-def _to_paths(files) -> list[str]:
-    """把 Gradio 上传的文件对象转成本地路径列表。"""
-    if not files:
-        return []
-    paths: list[str] = []
-    for f in files:
-        # gr.File 在不同版本可能返回带 .name 的对象或直接是路径字符串
-        path = getattr(f, "name", None) or f
-        paths.append(str(path))
-    return paths
+# ---------------------------------------------------------------------------
+# 桌面素材扫描
+# ---------------------------------------------------------------------------
+def _desktop_candidates() -> list[Path]:
+    """列出可能的桌面路径：本地桌面与 OneDrive 桌面都兼容。"""
+    home = Path.home()
+    candidates = [
+        home / "Desktop",
+        home / "桌面",
+        home / "OneDrive" / "Desktop",
+        home / "OneDrive" / "桌面",
+    ]
+    onedrive = os.environ.get("OneDrive")
+    if onedrive:
+        candidates += [Path(onedrive) / "Desktop", Path(onedrive) / "桌面"]
+    # 去重并只保留真实存在的目录
+    seen: set[str] = set()
+    result: list[Path] = []
+    for c in candidates:
+        key = str(c).lower()
+        if key not in seen and c.is_dir():
+            seen.add(key)
+            result.append(c)
+    return result
 
 
-def generate(files, prompt: str, num_outputs: int, model: str):
-    image_paths = _to_paths(files)
+def _find_material_dir(folder_name: str) -> Path | None:
+    """在各候选桌面下找到指定名称的素材文件夹。"""
+    for desktop in _desktop_candidates():
+        target = desktop / folder_name
+        if target.is_dir():
+            return target
+    return None
 
-    if not image_paths:
-        raise gr.Error("请先上传至少一张图片。")
-    if len(image_paths) > MAX_INPUT_IMAGES:
-        raise gr.Error(f"最多支持 {MAX_INPUT_IMAGES} 张输入图片。")
-    if not prompt or not prompt.strip():
-        raise gr.Error("请输入提示词。")
 
-    try:
-        outputs, status = run_edit(
-            image_paths, prompt.strip(), int(num_outputs), model=model
+def _list_images(folder: Path) -> list[Path]:
+    """列出文件夹里的所有图片文件。"""
+    return [
+        p for p in sorted(folder.iterdir())
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+    ]
+
+
+def _order_key(name: str) -> tuple:
+    """背景图排序键：优先按文件名里的数字（阿拉伯或中文）排序。"""
+    m = re.search(r"\d+", name)
+    if m:
+        return (0, int(m.group()), name)
+    for ch in name:
+        if ch in _CN_NUMS:
+            return (0, _CN_NUMS[ch], name)
+    return (1, 0, name)
+
+
+@app.post("/api/scan")
+def scan() -> JSONResponse:
+    """读取桌面素材：背景图列表（排序后）+ 人物参照图。"""
+    bg_dir = _find_material_dir(BG_FOLDER_NAME)
+    person_dir = _find_material_dir(PERSON_FOLDER_NAME)
+    if bg_dir is None or person_dir is None:
+        missing = [
+            name for name, d in
+            [(BG_FOLDER_NAME, bg_dir), (PERSON_FOLDER_NAME, person_dir)]
+            if d is None
+        ]
+        return JSONResponse(
+            {"error": f"在桌面上找不到文件夹：{'、'.join(missing)}。"
+                      "请确认桌面上存在「背景图」和「人物」两个文件夹。"},
+            status_code=404,
         )
-    except ImageToolError as exc:
-        raise gr.Error(str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise gr.Error(f"生成失败：{exc}") from exc
 
-    if not outputs:
-        raise gr.Error("没有生成任何图片，请调整提示词后重试。")
-
-    return outputs, status
-
-
-def fill_template(template_key: str) -> str:
-    """按所选模板返回提示词文本，供“填充模板”按钮写入提示词框。"""
-    return build_prompt(template_key)
-
-
-def generate_agent(files, user_request: str, task_type: str, model: str):
-    """智能体模式：看图 → 自动写提示词 → 出图 → 自检 → 自动重试。"""
-    image_paths = _to_paths(files)
-
-    if not image_paths:
-        raise gr.Error("请先上传至少一张图片。")
-    if len(image_paths) > MAX_INPUT_IMAGES:
-        raise gr.Error(f"最多支持 {MAX_INPUT_IMAGES} 张输入图片。")
-    if not user_request or not user_request.strip():
-        raise gr.Error("请用一句话描述你想要的效果。")
-
-    try:
-        outputs, thoughts, status = run_agent(
-            image_paths, task_type, user_request.strip(), model=model
+    backgrounds = sorted(_list_images(bg_dir), key=lambda p: _order_key(p.stem))
+    persons = _list_images(person_dir)
+    if not backgrounds:
+        return JSONResponse(
+            {"error": f"「{BG_FOLDER_NAME}」文件夹里没有找到任何图片。"},
+            status_code=404,
         )
-    except ImageToolError as exc:
-        raise gr.Error(str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise gr.Error(f"智能体运行失败：{exc}") from exc
-
-    if not outputs:
-        raise gr.Error("没有生成任何图片，请调整需求后重试。")
-
-    return outputs, thoughts, status
-
-
-def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Qwen-Image 图片编辑智能体") as demo:
-        gr.Markdown(
-            "# Qwen-Image 图片编辑智能体\n"
-            "- **\U0001F916 智能体模式**：只需上传图片 + 一句白话需求，"
-            "由 `qwen3.7-plus` 自动看图、写提示词、出图、自检并自动重试；\n"
-            "- **\U0001F6E0\uFE0F 手动模式**：自己填提示词、选模型，适合精细控制。"
+    if not persons:
+        return JSONResponse(
+            {"error": f"「{PERSON_FOLDER_NAME}」文件夹里没有找到任何图片。"},
+            status_code=404,
         )
+    # 人物图优先取文件名包含「人物」的那张，保证 planner 的文件名角色绑定生效
+    person = next((p for p in persons if "人物" in p.stem), persons[0])
 
-        with gr.Tab("\U0001F916 智能体模式"):
-            gr.Markdown(
-                "上传图片（人物参考图 + 可选背景图，最多 "
-                f"{MAX_INPUT_IMAGES} 张），用一句话描述你想要的效果，"
-                "剩下的交给智能体。"
-            )
-            with gr.Row():
-                with gr.Column(scale=1):
-                    a_files = gr.File(
-                        label=f"上传图片（最多 {MAX_INPUT_IMAGES} 张）",
-                        file_count="multiple",
-                        file_types=["image"],
-                    )
-                    a_task = gr.Radio(
-                        label="任务类型",
-                        choices=_TASK_RADIO_CHOICES,
-                        value=_TASK_RADIO_CHOICES[0][1],
-                    )
-                    a_request = gr.Textbox(
-                        label="一句话需求（白话即可）",
-                        placeholder=(
-                            "例：让孩子躲在大叶片后面探出半个身子看小鸭；"
-                            "或：把他做成皮克斯风卡通形象站在花园里"
-                        ),
-                        lines=3,
-                    )
-                    a_model = gr.Radio(
-                        label="出图模型",
-                        choices=_RADIO_CHOICES,
-                        value=MODEL_AUTO,
-                    )
-                    a_run_btn = gr.Button("\U0001F916 启动智能体", variant="primary")
-                with gr.Column(scale=1):
-                    a_gallery = gr.Gallery(
-                        label="生成结果",
-                        columns=2,
-                        height="auto",
-                    )
-                    a_status = gr.Textbox(label="状态", interactive=False)
-                    a_thoughts = gr.Markdown(label="智能体思考过程")
+    _files.clear()
+    bg_items = []
+    for i, p in enumerate(backgrounds, start=1):
+        fid = f"bg{i}"
+        _files[fid] = str(p)
+        bg_items.append({"id": fid, "name": p.stem, "url": f"/api/file/{fid}"})
+    _files["person"] = str(person)
 
-            a_run_btn.click(
-                fn=generate_agent,
-                inputs=[a_files, a_request, a_task, a_model],
-                outputs=[a_gallery, a_thoughts, a_status],
-            )
+    return JSONResponse({
+        "backgrounds": bg_items,
+        "person": {"id": "person", "name": person.stem, "url": "/api/file/person"},
+    })
 
-        with gr.Tab("\U0001F6E0\uFE0F 手动模式"):
-            gr.Markdown(
-                f"上传图片（最多 {MAX_INPUT_IMAGES} 张）并输入提示词进行编辑。\n"
-                "- 默认使用阿里百炼 `Qwen-Image-2.0-Pro`，调用失败时自动切换到"
-                "硅基流动 `Qwen/Qwen-Image-Edit-2509`；\n"
-                "- 也可在下方手动指定要使用的模型。"
-            )
-            with gr.Row():
-                with gr.Column(scale=1):
-                    files = gr.File(
-                        label=f"上传图片（最多 {MAX_INPUT_IMAGES} 张）",
-                        file_count="multiple",
-                        file_types=["image"],
-                    )
-                    prompt = gr.Textbox(
-                        label="提示词",
-                        placeholder="例如：把背景换成雪山；将两张图中的人物合成到同一场景",
-                        lines=3,
-                    )
-                    template_choice = gr.Dropdown(
-                        label="内置提示词模板（真人合成到绘本）",
-                        choices=_TEMPLATE_RADIO_CHOICES,
-                        value="",
-                    )
-                    fill_btn = gr.Button("填充模板到提示词")
-                    model = gr.Radio(
-                        label="模型选择",
-                        choices=_RADIO_CHOICES,
-                        value=MODEL_AUTO,
-                    )
-                    num_outputs = gr.Number(
-                        label="输出张数（最多 6 张）",
-                        value=1,
-                        minimum=1,
-                        maximum=6,
-                        step=1,
-                        precision=0,
-                    )
-                    run_btn = gr.Button("开始编辑", variant="primary")
-                with gr.Column(scale=1):
-                    gallery = gr.Gallery(
-                        label="生成结果",
-                        columns=2,
-                        height="auto",
-                    )
-                    status = gr.Textbox(label="状态", interactive=False)
 
-            run_btn.click(
-                fn=generate,
-                inputs=[files, prompt, num_outputs, model],
-                outputs=[gallery, status],
-            )
+@app.get("/api/file/{fid}")
+def get_file(fid: str):
+    """按注册表 id 返回图片文件（素材图或生成结果）。"""
+    path = _files.get(fid)
+    if not path or not Path(path).is_file():
+        return JSONResponse({"error": "文件不存在或已失效。"}, status_code=404)
+    return FileResponse(path)
 
-            fill_btn.click(
-                fn=fill_template,
-                inputs=[template_choice],
-                outputs=[prompt],
-            )
-    return demo
+
+# ---------------------------------------------------------------------------
+# 生成（SSE 流式推送步骤事件）
+# ---------------------------------------------------------------------------
+def _sse(data: dict) -> str:
+    """把一个事件对象编码成 SSE 帧。"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@app.get("/api/generate")
+def generate(bg: str, task: str, model: str = MODEL_AUTO, request: str = ""):
+    """对「一张背景图 + 人物图」跑精简智能体流程，逐步骤 SSE 推送。
+
+    max_retries=0 时工作流天然只走「感知 → 规划 → 出图」三步，
+    出图后直接结束、不做自检重试。
+    """
+
+    def stream():
+        bg_path = _files.get(bg)
+        person_path = _files.get("person")
+        if not bg_path or not person_path:
+            yield _sse({"type": "error",
+                        "message": "素材已失效，请回到首页重新启动读取。"})
+            return
+        if task not in VALID_TASKS:
+            yield _sse({"type": "error", "message": f"未知的任务类型：{task}"})
+            return
+        if model not in VALID_MODELS:
+            yield _sse({"type": "error", "message": f"未知的模型选项：{model}"})
+            return
+
+        user_request = request.strip() or DEFAULT_REQUESTS[task]
+        try:
+            ctx = None
+            for event, ctx in run_agent_stream(
+                [bg_path, person_path], task, user_request, model, max_retries=0
+            ):
+                yield _sse({
+                    "type": "step",
+                    "key": event.step_key,
+                    "status": event.status,
+                    "summary": event.summary,
+                })
+            if ctx is None or not ctx.outputs:
+                yield _sse({"type": "error", "message": "模型没有返回图片。"})
+                return
+            # 把生成结果也登记进注册表，前端凭 id 取图
+            out_path = ctx.outputs[0]
+            fid = f"out_{bg}_{len(_files)}"
+            _files[fid] = out_path
+            yield _sse({
+                "type": "result",
+                "url": f"/api/file/{fid}",
+                "status": ctx.gen_status,
+            })
+        except ImageToolError as exc:
+            yield _sse({"type": "error", "message": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            yield _sse({"type": "error", "message": f"发生未知错误：{exc}"})
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 静态资源与首页
+# ---------------------------------------------------------------------------
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/")
+def index():
+    """返回单页应用入口。"""
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 if __name__ == "__main__":
-    build_ui().launch()
+    uvicorn.run(app, host="127.0.0.1", port=7860)
