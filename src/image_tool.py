@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import mimetypes
 import os
+import tempfile
 import time
 from http import HTTPStatus
 from pathlib import Path
@@ -24,6 +25,17 @@ from urllib.parse import unquote, urlsplit
 
 import requests
 from dashscope import MultiModalConversation
+
+# Pillow 为可选依赖：仅在「感知压缩」时使用，缺失时自动跳过压缩、
+# 直接上传原图，不影响功能。
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+    print(
+        "[提示] 未检测到 Pillow，感知阶段的图片压缩已跳过；"
+        "执行 py -3 -m pip install pillow 可启用该优化。"
+    )
 
 # 阿里百炼 - 千问图像生成与编辑模型 ID
 DASHSCOPE_MODEL = "qwen-image-2.0-pro"
@@ -50,6 +62,13 @@ MAX_OUTPUT_IMAGES = 6
 # 与上传通道无关）。超过时服务端报 InvalidParameter，本地提前拦截
 # 可省去一次无意义的上传，让 auto 模式立即降级到硅基流动。
 _DASHSCOPE_EDIT_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+# 感知（视觉理解）上传前的压缩参数：视觉模型内部同样会缩放图片，
+# 上传几 MB 的原图只会拖慢上传与识别。压缩仅作用于「感知副本」，
+# 出图仍使用未压缩的原图，画面质量不受影响。
+_VL_MAX_SIDE = 1600        # 压缩后最长边像素
+_VL_JPEG_QUALITY = 85      # JPEG 质量
+_VL_SKIP_BYTES = 1500000   # 小于该体积的图直接原样上传
 
 # 网络请求超时（秒）。图像生成耗时较长，给足余量。
 REQUEST_TIMEOUT = 300
@@ -160,6 +179,41 @@ def _to_file_uri(path: str) -> str:
     if not p.is_file():
         raise ImageToolError(f"找不到图片文件：{path}")
     return p.resolve().as_uri()
+
+
+def _compress_for_vision(path: str) -> str | None:
+    """为大图生成供视觉理解上传的压缩临时副本，返回临时文件路径。
+
+    图片本身足够小、压缩后体积反而更大或 Pillow 不可用时返回 None，
+    调用方回退为直接上传原图。临时文件由调用方在用完后删除。
+    """
+    if Image is None:
+        return None
+    p = Path(path)
+    if not p.is_file() or p.stat().st_size <= _VL_SKIP_BYTES:
+        return None
+
+    tmp_path: str | None = None
+    try:
+        with Image.open(p) as img:
+            img = img.convert("RGB")
+            w, h = img.size
+            scale = _VL_MAX_SIDE / max(w, h)
+            if scale < 1:
+                img = img.resize(
+                    (round(w * scale), round(h * scale)), Image.LANCZOS
+                )
+            fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="vl_")
+            os.close(fd)
+            img.save(tmp_path, "JPEG", quality=_VL_JPEG_QUALITY, optimize=True)
+        if os.path.getsize(tmp_path) >= p.stat().st_size:
+            os.remove(tmp_path)
+            return None
+        return tmp_path
+    except Exception:  # noqa: BLE001  压缩失败不阻断主流程，回退原图
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return None
 
 
 def _encode_image(path: str) -> str:
@@ -293,6 +347,9 @@ def understand_with_dashscope(
 ) -> str:
     """用阿里百炼 qwen3.7-plus 看图并返回文本，作为智能体的感知与推理能力。
 
+    过大的图片会先生成压缩副本再上传（见 ``_compress_for_vision``），
+    以缩短上传与识别耗时；该压缩只影响本函数，不涉及出图。
+
     Args:
         image_paths: 参与理解的图片本地路径（可为空，表示纯文本推理）。
         prompt: 提给视觉模型的问题 / 指令。
@@ -310,7 +367,17 @@ def understand_with_dashscope(
         )
     api_key = _get_dashscope_key()
 
-    content: list[dict] = [{"image": _to_file_uri(p)} for p in image_paths]
+    upload_paths: list[str] = []
+    temp_paths: list[str] = []
+    for p in image_paths:
+        tmp = _compress_for_vision(p)
+        if tmp:
+            temp_paths.append(tmp)
+            upload_paths.append(tmp)
+        else:
+            upload_paths.append(p)
+
+    content: list[dict] = [{"image": _to_file_uri(p)} for p in upload_paths]
     content.append({"text": prompt})
     messages: list[dict] = []
     if system and system.strip():
@@ -327,6 +394,13 @@ def understand_with_dashscope(
         )
     except Exception as exc:  # noqa: BLE001
         raise ImageToolError(f"调用 {model} 失败：{exc}") from exc
+    finally:
+        # SDK 调用返回（或抛错）后上传即已结束，可安全清理临时压缩副本
+        for tmp in temp_paths:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     if _attr(response, "status_code") != HTTPStatus.OK:
         raise ImageToolError(
@@ -344,7 +418,7 @@ def edit_with_dashscope(
     image_paths: list[str],
     prompt: str,
     num_outputs: int = 1,
-    size: str = "2048*2048",
+    size: str = "1024*1024",
 ) -> list[str]:
     """用阿里百炼 Qwen-Image-2.0-Pro 按提示词编辑图片。
 
@@ -353,6 +427,8 @@ def edit_with_dashscope(
         prompt: 编辑指令。
         num_outputs: 期望输出的图片数量（1-6）。
         size: 输出分辨率“宽*高”，总像素需在 512*512 至 2048*2048 之间。
+            默认 1024*1024：像素量约为 2048*2048 的四分之一，出图明显
+            更快，屏幕展示足够清晰；需要更高画质时可手动传 2048*2048。
 
     Returns:
         生成图片的本地路径列表。
@@ -384,7 +460,9 @@ def edit_with_dashscope(
             n=num_outputs,
             watermark=False,
             negative_prompt=" ",
-            prompt_extend=True,
+            # 关闭服务端提示词改写：智能体的「规划」步骤已产出结构化专业
+            # 提示词，再改写一遍属于重复劳动，还会明显拖长出图耗时。
+            prompt_extend=False,
             size=size,
         )
     except Exception as exc:  # noqa: BLE001

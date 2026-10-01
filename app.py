@@ -16,12 +16,19 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import webbrowser
 from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from src.agent import MODEL_AUTO, MODEL_BAILIAN, MODEL_SILICONFLOW
@@ -55,6 +62,16 @@ _CN_NUMS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
             "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
 app = FastAPI(title="绘本智能体")
+
+
+@app.middleware("http")
+async def no_cache_frontend(request: Request, call_next):
+    """给页面和静态资源加 no-cache：浏览器每次使用前必须向服务器确认文件是否有更新，
+    改完前端代码后普通刷新即可生效，不再需要 Ctrl+F5（未改动时走 304，开销很小）。"""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 # 扫描结果注册表：文件 id -> 本地绝对路径。
 # 前端只拿到 id，通过 /api/file/{fid} 取图，避免把本地路径直接暴露成任意文件读取。
@@ -248,5 +265,22 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+# 浏览器会自发探测 /favicon.ico，直接返回一个内联 SVG 图标，避免 404 日志
+FAVICON_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>"
+    "<text y='.9em' font-size='90'>\U0001F4D6</text></svg>"
+)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """返回标签页小图标。"""
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml")
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=7860)
+    # 服务就绪大约需要一两秒，延迟打开浏览器，避免页面比服务先一步请求失败
+    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:7860")).start()
+    # timeout_graceful_shutdown：Ctrl+C 后最多等 3 秒，超时强制断开残留连接，
+    # 避免浏览器还挂着 keep-alive/SSE 连接时关不掉、卡在 "Shutting down"
+    uvicorn.run(app, host="127.0.0.1", port=7860, timeout_graceful_shutdown=3)

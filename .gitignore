@@ -1,6 +1,10 @@
 # 环境变量与密钥
 .env
-
+.trae/
+.qoder/
+.agents/
+.claude/
+skills-lock.json
 # 生成结果与临时上传
 outputs/
 uploads/

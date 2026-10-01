@@ -3,53 +3,173 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AI 绘本工坊 · 绘本智能体</title>
+  <meta name="theme-color" content="#100D09" />
+  <title>AI 绘本工坊 · 照片进，绘本出</title>
+  <!-- 内联 SVG 图标：机器人小头像，避免浏览器请求 /favicon.ico 产生 404 -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <!-- 全局背景装饰：渐变光斑 + 网格 -->
-  <div class="backdrop">
-    <div class="orb orb-a"></div>
-    <div class="orb orb-b"></div>
-    <div class="grid-layer"></div>
+  <!-- 全局背景：极光光斑 + 蓝图网格 + 暖光层（成书时点亮）+ 星链粒子 -->
+  <div class="backdrop" aria-hidden="true">
+    <div class="aurora aurora-a"></div>
+    <div class="aurora aurora-b"></div>
+    <div class="blueprint"></div>
+    <div class="warmth"></div>
+    <canvas class="fx-canvas" id="fxCanvas"></canvas>
   </div>
 
+  <!-- ============ 顶部 HUD：品牌 + 流程步进 ============ -->
+  <header class="hud">
+    <div class="hud-brand">
+      <svg class="hud-bot" viewBox="0 0 36 34" xmlns="http://www.w3.org/2000/svg" fill="none" aria-hidden="true">
+        <path d="M18 9 v-4" stroke="rgba(238,206,150,0.85)" stroke-width="2" stroke-linecap="round"/>
+        <circle class="antenna-dot" cx="18" cy="3.5" r="2.6" fill="#f0a82e"/>
+        <rect x="5" y="9" width="26" height="22" rx="9" fill="#2a1f12" stroke="rgba(236,206,152,0.45)" stroke-width="1.6"/>
+        <rect x="10" y="15" width="16" height="10" rx="5" fill="#0f0a06" stroke="rgba(240,168,46,0.3)" stroke-width="1"/>
+        <circle cx="15" cy="20" r="1.8" fill="#f0a82e"/>
+        <circle cx="21" cy="20" r="1.8" fill="#f0a82e"/>
+      </svg>
+      <span class="hud-name">AI 绘本工坊</span>
+      <span class="hud-status"><i class="led"></i>智能体在线</span>
+    </div>
+    <nav class="hud-steps" id="hudSteps" aria-label="流程进度">
+      <span class="hstep" data-stage="stage-welcome"><i class="hstep-no">01</i><i class="hstep-txt">启动</i></span>
+      <span class="hstep" data-stage="stage-loading"><i class="hstep-no">02</i><i class="hstep-txt">素材</i></span>
+      <span class="hstep" data-stage="stage-console"><i class="hstep-no">03</i><i class="hstep-txt">生成</i></span>
+      <span class="hstep" data-stage="stage-book"><i class="hstep-no">04</i><i class="hstep-txt">成书</i></span>
+    </nav>
+  </header>
+
+  <main>
   <!-- ============ 阶段一 · 欢迎页 ============ -->
   <section id="stage-welcome" class="stage active">
     <div class="welcome-inner">
-      <p class="eyebrow">AI STORYBOOK AGENT</p>
-      <h1 class="headline">欢迎来到 <span class="grad-text">AI 绘本工坊</span></h1>
-      <p class="subline">读取素材 · 智能生成 · 装订成册</p>
+      <p class="kicker"><span class="kicker-led"></span>机器人已就位，等你按下启动</p>
+      <h1 class="headline">照片进，绘本出</h1>
+      <p class="subline">读桌面「背景图」「人物」文件夹，智能体自动感知、规划、出图，最后装订成册。</p>
 
-      <div class="model-switch" id="modelSwitch" role="group" aria-label="模型切换">
-        <button class="model-btn on" data-model="auto">
-          <span class="model-name">自动调度</span>
-          <span class="model-desc">百炼优先 · 失败自动切换</span>
-        </button>
-        <button class="model-btn" data-model="bailian">
-          <span class="model-name">阿里百炼</span>
-          <span class="model-desc">Qwen-Image-2.0-Pro</span>
-        </button>
-        <button class="model-btn" data-model="siliconflow">
-          <span class="model-name">硅基流动</span>
-          <span class="model-desc">Qwen-Image-Edit-2509</span>
-        </button>
+      <!-- 机器人吉祥物：眼睛跟随鼠标 / 悬停挥手 / 点击跳一下 -->
+      <div class="hero-bot" id="heroBot" aria-hidden="true">
+        <svg class="bot-svg" viewBox="0 0 220 258" xmlns="http://www.w3.org/2000/svg" fill="none">
+          <defs>
+            <linearGradient id="heroHeadG" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#4e3a22"/>
+              <stop offset="1" stop-color="#1f160d"/>
+            </linearGradient>
+            <linearGradient id="heroBodyG" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#3b2c19"/>
+              <stop offset="1" stop-color="#191108"/>
+            </linearGradient>
+            <linearGradient id="heroVisorG" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#0b0805"/>
+              <stop offset="1" stop-color="#120c07"/>
+            </linearGradient>
+          </defs>
+
+          <!-- 全息底座光环 -->
+          <g class="robot-ring">
+            <ellipse cx="110" cy="240" rx="72" ry="14" stroke="rgba(240,168,46,0.4)" stroke-width="2" stroke-dasharray="7 11"/>
+            <ellipse cx="110" cy="240" rx="50" ry="9.5" stroke="rgba(196,97,60,0.4)" stroke-width="1.5"/>
+          </g>
+
+          <!-- 手臂：右臂响应悬停挥手 -->
+          <g class="robot-arm robot-arm-left">
+            <rect x="38" y="146" width="32" height="13" rx="6.5" fill="#332616"/>
+            <rect x="30" y="146" width="16" height="44" rx="8" fill="#2a1f12" stroke="rgba(236,206,152,0.28)" stroke-width="1.5"/>
+          </g>
+          <g class="robot-arm robot-arm-right">
+            <rect x="150" y="146" width="32" height="13" rx="6.5" fill="#332616"/>
+            <rect x="174" y="146" width="16" height="44" rx="8" fill="#2a1f12" stroke="rgba(236,206,152,0.28)" stroke-width="1.5"/>
+          </g>
+
+          <!-- 悬浮喷口与光束 -->
+          <path d="M94 202 h32 l-7 12 h-18 z" fill="#2a1f12"/>
+          <ellipse class="jet-flame" cx="110" cy="219" rx="14" ry="6" fill="rgba(240,168,46,0.5)"/>
+          <path class="jet-beam" d="M96 219 h28 l-14 18 z" fill="rgba(240,168,46,0.18)"/>
+
+          <!-- 身体与胸口能量核 -->
+          <g class="robot-body">
+            <rect x="66" y="140" width="88" height="64" rx="26" fill="url(#heroBodyG)" stroke="rgba(236,206,152,0.32)" stroke-width="2"/>
+            <circle class="chest-glow" cx="110" cy="167" r="15" fill="rgba(240,168,46,0.16)"/>
+            <rect class="chest-gem" x="102" y="159" width="16" height="16" rx="4" transform="rotate(45 110 167)" fill="#f0a82e"/>
+          </g>
+
+          <!-- 头部 -->
+          <g class="robot-head">
+            <path d="M110 40 v-14" stroke="rgba(238,206,150,0.8)" stroke-width="3" stroke-linecap="round"/>
+            <circle class="antenna-halo" cx="110" cy="19" r="10" fill="rgba(240,168,46,0.22)"/>
+            <circle class="antenna-dot" cx="110" cy="19" r="5" fill="#f0a82e"/>
+            <rect x="40" y="74" width="10" height="28" rx="5" fill="#332616"/>
+            <rect x="170" y="74" width="10" height="28" rx="5" fill="#332616"/>
+            <rect x="50" y="40" width="120" height="94" rx="32" fill="url(#heroHeadG)" stroke="rgba(236,206,152,0.38)" stroke-width="2"/>
+            <rect x="64" y="58" width="92" height="54" rx="26" fill="url(#heroVisorG)" stroke="rgba(240,168,46,0.3)" stroke-width="1.5"/>
+            <rect class="visor-sheen" x="70" y="62" width="80" height="12" rx="6" fill="rgba(255,255,255,0.05)"/>
+            <g class="robot-eye">
+              <circle cx="93" cy="82" r="10" fill="rgba(240,168,46,0.2)"/>
+              <g class="bot-pupil"><circle cx="93" cy="82" r="5.5" fill="#f0a82e"/></g>
+            </g>
+            <g class="robot-eye">
+              <circle cx="127" cy="82" r="10" fill="rgba(240,168,46,0.2)"/>
+              <g class="bot-pupil"><circle cx="127" cy="82" r="5.5" fill="#f0a82e"/></g>
+            </g>
+            <path d="M100 102 q10 7 20 0" stroke="rgba(240,168,46,0.6)" stroke-width="2.5" stroke-linecap="round"/>
+          </g>
+        </svg>
+      </div>
+
+      <div class="engine-pick">
+        <p class="pick-label">出图引擎</p>
+        <div class="model-switch" id="modelSwitch" role="group" aria-label="模型切换">
+          <button class="model-btn on" data-model="auto">
+            <span class="model-led"></span>
+            <span class="model-name">自动调度</span>
+            <span class="model-desc">百炼优先 · 失败自动切换</span>
+          </button>
+          <button class="model-btn" data-model="bailian">
+            <span class="model-led"></span>
+            <span class="model-name">阿里百炼</span>
+            <span class="model-desc">Qwen-Image-2.0-Pro</span>
+          </button>
+          <button class="model-btn" data-model="siliconflow">
+            <span class="model-led"></span>
+            <span class="model-name">硅基流动</span>
+            <span class="model-desc">Qwen-Image-Edit-2509</span>
+          </button>
+        </div>
       </div>
 
       <button id="btnLaunch" class="btn-launch">
         <span class="btn-launch-glow"></span>
-        启 动
+        <span class="btn-launch-text">启动工坊</span>
       </button>
+      <p class="launch-hint">将读取桌面「背景图」与「人物」文件夹</p>
     </div>
   </section>
 
   <!-- ============ 阶段二 · 读取素材 ============ -->
   <section id="stage-loading" class="stage">
     <div class="loading-inner" id="loadingView">
-      <div class="scan-ring">
-        <div class="scan-ring-core"></div>
+      <div class="scan-stage">
+        <div class="radar">
+          <span class="radar-sweep"></span>
+          <span class="radar-ring radar-ring-a"></span>
+          <span class="radar-ring radar-ring-b"></span>
+          <!-- 扫描机器人：面罩里有一条上下扫动的扫描线 -->
+          <svg class="scan-bot" viewBox="0 0 64 58" xmlns="http://www.w3.org/2000/svg" fill="none" aria-hidden="true">
+            <path d="M32 13 v-6" stroke="rgba(238,206,150,0.85)" stroke-width="2.5" stroke-linecap="round"/>
+            <circle class="antenna-dot" cx="32" cy="5.5" r="3.5" fill="#f0a82e"/>
+            <rect x="10" y="13" width="44" height="38" rx="15" fill="#2a1f12" stroke="rgba(236,206,152,0.45)" stroke-width="2"/>
+            <rect x="17" y="22" width="30" height="20" rx="10" fill="#0f0a06" stroke="rgba(240,168,46,0.35)" stroke-width="1"/>
+            <g class="robot-eye"><circle cx="27" cy="32" r="3" fill="#f0a82e"/></g>
+            <g class="robot-eye"><circle cx="37" cy="32" r="3" fill="#f0a82e"/></g>
+            <rect class="bot-scanline" x="19" y="31" width="26" height="2" rx="1" fill="rgba(240,168,46,0.75)"/>
+          </svg>
+        </div>
       </div>
-      <p class="loading-text">正在读取文件中<span class="dots"><i>.</i><i>.</i><i>.</i></span></p>
+      <p class="loading-text">正在读取素材<span class="dots"><i>.</i><i>.</i><i>.</i></span></p>
+      <!-- 终端风格扫描日志：由 app.js 逐行追加 -->
+      <ul class="scan-log" id="scanLog" aria-hidden="true"></ul>
     </div>
     <div class="loading-error hidden" id="loadingError">
       <p class="error-icon">!</p>
@@ -63,8 +183,17 @@
     <div class="console-inner">
       <header class="console-head">
         <div class="console-title">
-          <span class="pulse-dot"></span>
-          智能体运行中
+          <!-- 小机器人头像：天线常亮呼吸，眼睛会眨 -->
+          <svg class="bot-avatar" viewBox="0 0 64 58" xmlns="http://www.w3.org/2000/svg" fill="none" aria-hidden="true">
+            <path d="M32 13 v-6" stroke="rgba(238,206,150,0.85)" stroke-width="2.5" stroke-linecap="round"/>
+            <circle class="antenna-dot" cx="32" cy="5.5" r="3.5" fill="#f0a82e"/>
+            <rect x="10" y="13" width="44" height="38" rx="15" fill="#2a1f12" stroke="rgba(236,206,152,0.45)" stroke-width="2"/>
+            <rect x="17" y="22" width="30" height="20" rx="10" fill="#0f0a06" stroke="rgba(240,168,46,0.35)" stroke-width="1"/>
+            <g class="robot-eye"><circle cx="27" cy="32" r="3" fill="#f0a82e"/></g>
+            <g class="robot-eye"><circle cx="37" cy="32" r="3" fill="#f0a82e"/></g>
+          </svg>
+          <span class="console-name">智能体运行中</span>
+          <span class="console-pipe">感知 → 规划 → 出图</span>
         </div>
         <div class="console-meta">
           <span class="meta-chip" id="chipProgress">第 1 / 1 张</span>
@@ -76,7 +205,7 @@
       <div class="timeline" id="timeline"></div>
 
       <!-- 任务类型询问卡片 -->
-      <div class="ask-card hidden" id="askCard">
+      <div class="ask-card hud-frame hidden" id="askCard">
         <p class="ask-title" id="askTitle">第 1 张 · 选择任务类型</p>
         <p class="ask-sub" id="askSub">背景：背景图（一）</p>
         <!-- 本次待传素材预览：背景图 + 人物图 -->
@@ -104,14 +233,33 @@
           </button>
         </div>
       </div>
+
+      <!-- 全部生成完毕：装订入口（不自动跳绘本，先让用户看清最后一张） -->
+      <div class="book-cta hud-frame hidden" id="bookCta">
+        <p class="book-cta-title">全部生成完成</p>
+        <p class="book-cta-sub" id="bookCtaCount">已完成 0 张</p>
+        <button class="btn-make-book" id="btnMakeBook">生成绘本</button>
+      </div>
     </div>
   </section>
 
   <!-- ============ 阶段四 · 儿童绘本 ============ -->
   <section id="stage-book" class="stage">
     <div class="book-hall">
-      <p class="book-caption">你的专属绘本已装订完成 · 点击右页向后翻，点击左页向前翻</p>
+      <p class="book-caption">
+        <!-- 陪读机器人 -->
+        <svg class="bot-mini" viewBox="0 0 64 58" xmlns="http://www.w3.org/2000/svg" fill="none" aria-hidden="true">
+          <path d="M32 13 v-6" stroke="rgba(238,206,150,0.85)" stroke-width="2.5" stroke-linecap="round"/>
+          <circle class="antenna-dot" cx="32" cy="5.5" r="3.5" fill="#f0a82e"/>
+          <rect x="10" y="13" width="44" height="38" rx="15" fill="#2a1f12" stroke="rgba(236,206,152,0.45)" stroke-width="2"/>
+          <rect x="17" y="22" width="30" height="20" rx="10" fill="#0f0a06" stroke="rgba(240,168,46,0.35)" stroke-width="1"/>
+          <g class="robot-eye"><circle cx="27" cy="32" r="3" fill="#f0a82e"/></g>
+          <g class="robot-eye"><circle cx="37" cy="32" r="3" fill="#f0a82e"/></g>
+        </svg>
+        装订完成 · 点右页向后翻，点左页向前翻
+      </p>
       <div class="book-scene">
+        <div class="book-dust" aria-hidden="true"></div>
         <div class="book" id="book"><!-- 书页由 JS 生成 --></div>
       </div>
       <p class="scroll-hint">继续下滑<span class="scroll-arrow">↓</span></p>
@@ -121,6 +269,13 @@
       <button class="btn-regen" id="btnRegen">重新生成</button>
     </div>
   </section>
+  </main>
+
+  <!-- 图片放大查看：点击生成结果缩略图打开，点空白或按 Esc 关闭 -->
+  <div class="lightbox hidden" id="lightbox" role="dialog" aria-modal="true" aria-label="放大查看生成的图片">
+    <button class="lightbox-close" id="lightboxClose" aria-label="关闭放大查看">×</button>
+    <img class="lightbox-img" id="lightboxImg" alt="生成结果放大图" />
+  </div>
 
   <script src="/static/app.js"></script>
 </body>
