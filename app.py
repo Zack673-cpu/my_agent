@@ -3,7 +3,7 @@
 前端是 static/ 下的纯原生单页应用，整个体验分四个阶段：
 
 1. 欢迎页：选模型 → 点启动。
-2. 读取素材：POST /api/scan 读取桌面的「背景图」「人物」两个文件夹。
+2. 读取素材：POST /api/scan 读取项目 materials 下的「背景图」「人物」两个文件夹。
 3. 生成控制台：GET /api/generate（SSE）对每张背景图跑
    「感知 → 规划 → 出图」的精简智能体流程，逐步骤实时推送。
 4. 儿童绘本：前端把生成结果装进 3D 翻页绘本展示。
@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import threading
 import webbrowser
@@ -40,7 +39,8 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-# 桌面素材文件夹的约定名称
+# 素材根目录：项目内的 materials/，下面分「背景图」「人物」两个子文件夹
+MATERIALS_DIR = BASE_DIR / "materials"
 BG_FOLDER_NAME = "背景图"
 PERSON_FOLDER_NAME = "人物"
 
@@ -79,38 +79,12 @@ _files: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
-# 桌面素材扫描
+# 素材扫描（项目内 materials/ 目录）
 # ---------------------------------------------------------------------------
-def _desktop_candidates() -> list[Path]:
-    """列出可能的桌面路径：本地桌面与 OneDrive 桌面都兼容。"""
-    home = Path.home()
-    candidates = [
-        home / "Desktop",
-        home / "桌面",
-        home / "OneDrive" / "Desktop",
-        home / "OneDrive" / "桌面",
-    ]
-    onedrive = os.environ.get("OneDrive")
-    if onedrive:
-        candidates += [Path(onedrive) / "Desktop", Path(onedrive) / "桌面"]
-    # 去重并只保留真实存在的目录
-    seen: set[str] = set()
-    result: list[Path] = []
-    for c in candidates:
-        key = str(c).lower()
-        if key not in seen and c.is_dir():
-            seen.add(key)
-            result.append(c)
-    return result
-
-
 def _find_material_dir(folder_name: str) -> Path | None:
-    """在各候选桌面下找到指定名称的素材文件夹。"""
-    for desktop in _desktop_candidates():
-        target = desktop / folder_name
-        if target.is_dir():
-            return target
-    return None
+    """在项目的 materials 目录下找到指定名称的素材文件夹。"""
+    target = MATERIALS_DIR / folder_name
+    return target if target.is_dir() else None
 
 
 def _list_images(folder: Path) -> list[Path]:
@@ -134,7 +108,7 @@ def _order_key(name: str) -> tuple:
 
 @app.post("/api/scan")
 def scan() -> JSONResponse:
-    """读取桌面素材：背景图列表（排序后）+ 人物参照图。"""
+    """读取 materials 素材：背景图列表（排序后）+ 人物参照图。"""
     bg_dir = _find_material_dir(BG_FOLDER_NAME)
     person_dir = _find_material_dir(PERSON_FOLDER_NAME)
     if bg_dir is None or person_dir is None:
@@ -144,8 +118,8 @@ def scan() -> JSONResponse:
             if d is None
         ]
         return JSONResponse(
-            {"error": f"在桌面上找不到文件夹：{'、'.join(missing)}。"
-                      "请确认桌面上存在「背景图」和「人物」两个文件夹。"},
+            {"error": f"在项目 materials 目录下找不到文件夹：{'、'.join(missing)}。"
+                      "请确认 materials 下有「背景图」和「人物」两个文件夹。"},
             status_code=404,
         )
 
