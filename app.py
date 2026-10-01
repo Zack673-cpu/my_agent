@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
+    RedirectResponse,
     Response,
     StreamingResponse,
 )
@@ -235,8 +236,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/")
 def index():
-    """返回单页应用入口。"""
-    return FileResponse(STATIC_DIR / "index.html")
+    """跳转到静态入口页：前端资源用相对路径，本地与 GitHub Pages 通用。"""
+    return RedirectResponse(url="/static/index.html")
 
 
 # 浏览器会自发探测 /favicon.ico，直接返回一个内联 SVG 图标，避免 404 日志

@@ -42,6 +42,28 @@ const CHECK_SVG = `<svg class="node-check" viewBox="0 0 24 24" aria-hidden="true
 
 const $ = (id) => document.getElementById(id);
 
+/* ---------- 演示模式 ----------
+   GitHub Pages / Gitee Pages 只有静态页面、没有后端：在这些域名下（或 URL 带 ?demo=1）
+   自动进入演示模式，用仓库自带的示例图模拟完整四阶段流程，不请求后端、不调用任何 AI 接口。 */
+const DEMO = /(github|gitee)\.io$/.test(location.hostname)
+  || new URLSearchParams(location.search).has("demo");
+
+const DEMO_DATA = {
+  backgrounds: [
+    { id: "demo_bg1", name: "背景图（一）", url: "assets/demo/bg-1.jpg" },
+    { id: "demo_bg2", name: "背景图（二）", url: "assets/demo/bg-2.jpg" },
+  ],
+  person: { id: "demo_person", name: "人物", url: "assets/demo/person.jpg" },
+  results: ["assets/demo/out-1.jpg", "assets/demo/out-2.jpg"],
+};
+
+/* 演示模式下三步流程的说明文案 */
+const DEMO_STEP_TEXT = {
+  perceive: { running: "正在观察背景与人物……", done: "已提取人物特征与场景信息" },
+  plan: { running: "正在撰写这一页的提示词……", done: "提示词已写好，画面构图确定" },
+  generate: { running: "图像模型正在画画……", done: "画面已生成" },
+};
+
 /* ---------- 阶段切换 ---------- */
 const STAGE_ORDER = ["stage-welcome", "stage-loading", "stage-console", "stage-book"];
 
@@ -69,6 +91,12 @@ function updateHudSteps(activeId) {
 }
 
 updateHudSteps("stage-welcome"); // 首屏：点亮第 1 步
+
+/* 演示模式：顶部状态条给出提示，访客知道这是界面预览 */
+if (DEMO) {
+  const status = document.querySelector(".hud-status");
+  if (status) status.innerHTML = '<i class="led"></i>演示模式 · 示例数据';
+}
 
 /* ==========================================================================
    阶段一 · 欢迎页
@@ -149,6 +177,18 @@ async function startScan() {
   };
   pushLog();
   const logTimer = setInterval(pushLog, 700);
+
+  // 演示模式：不请求后端，稍等片刻后用示例数据进入控制台
+  if (DEMO) {
+    await new Promise((r) => setTimeout(r, 2100));
+    clearInterval(logTimer);
+    state.backgrounds = DEMO_DATA.backgrounds;
+    state.person = DEMO_DATA.person;
+    state.results = new Array(state.backgrounds.length).fill(null);
+    state.current = 0;
+    enterConsole();
+    return;
+  }
 
   // 至少停留一小段时间，避免加载页一闪而过
   const minWait = new Promise((r) => setTimeout(r, 900));
@@ -246,10 +286,71 @@ function buildJobCard(index, taskLabel) {
   return card;
 }
 
-/* ---- 执行一张图的生成（SSE）---- */
+/* ---- 更新一个步骤的状态与说明（SSE 与演示模式共用） ---- */
+function applyStep(card, key, status, summary) {
+  const stepEl = card.querySelector(`.step[data-step="${key}"]`);
+  if (!stepEl) return;
+  stepEl.classList.remove("running", "done");
+  stepEl.classList.add(status === "running" ? "running" : "done");
+  // 完成时在菱形节点里画一个自绘对勾，运行中清空
+  stepEl.querySelector(".step-node").innerHTML =
+    status === "running" ? "" : CHECK_SVG;
+  if (summary) {
+    stepEl.querySelector(".step-summary").textContent = summary;
+  }
+}
+
+/* ---- 收尾：写入结果缩略图并推进下一张（SSE 与演示模式共用） ---- */
+function finishJob(card, badge, index, taskLabel, url, statusText) {
+  card.classList.replace("running", "done");
+  state.results[index] = url;
+  badge.textContent = `${taskLabel} · 完成`;
+  badge.classList.add("ok");
+  const box = document.createElement("div");
+  box.className = "job-result";
+  box.innerHTML = `
+        <img class="job-thumb" src="${url}" alt="第 ${index + 1} 张生成结果"
+             role="button" tabindex="0" title="点击放大查看"
+             aria-label="放大查看第 ${index + 1} 张生成结果" />
+        <p class="job-result-note">已暂存第 ${index + 1} 张 · 点击图片可放大查看。${statusText || ""}</p>`;
+  card.appendChild(box);
+  nextJob();
+}
+
+/* ---- 演示模式：用定时器模拟「感知 → 规划 → 出图」，不请求后端 ---- */
+function runDemoJob(card, badge, index, taskLabel) {
+  const seq = ["perceive", "plan", "generate"];
+  const delays = [1200, 1300, 1700];
+  let i = 0;
+
+  const next = () => {
+    if (i >= seq.length) {
+      finishJob(card, badge, index, taskLabel,
+        DEMO_DATA.results[index % DEMO_DATA.results.length], "（演示模式 · 示例图）");
+      return;
+    }
+    const key = seq[i];
+    const delay = delays[i];
+    i += 1;
+    applyStep(card, key, "running", DEMO_STEP_TEXT[key].running);
+    setTimeout(() => {
+      applyStep(card, key, "done", DEMO_STEP_TEXT[key].done);
+      setTimeout(next, 350); // 完成后再稍停一下，节奏更接近真实流程
+    }, delay);
+  };
+  next();
+}
+
+/* ---- 执行一张图的生成（真实后端走 SSE；演示模式走定时器模拟） ---- */
 function runJob(index, task, taskLabel, extra) {
   const card = buildJobCard(index, taskLabel);
   const badge = card.querySelector(".job-badge");
+
+  if (DEMO) {
+    runDemoJob(card, badge, index, taskLabel);
+    return;
+  }
+
   const params = new URLSearchParams({
     bg: state.backgrounds[index].id,
     task,
@@ -268,34 +369,13 @@ function runJob(index, task, taskLabel, extra) {
     try { msg = JSON.parse(e.data); } catch { return; }
 
     if (msg.type === "step") {
-      const stepEl = card.querySelector(`.step[data-step="${msg.key}"]`);
-      if (!stepEl) return;
-      stepEl.classList.remove("running", "done");
-      stepEl.classList.add(msg.status === "running" ? "running" : "done");
-      // 完成时在菱形节点里画一个自绘对勾，运行中清空
-      stepEl.querySelector(".step-node").innerHTML =
-        msg.status === "running" ? "" : CHECK_SVG;
-      if (msg.summary) {
-        stepEl.querySelector(".step-summary").textContent = msg.summary;
-      }
+      applyStep(card, msg.key, msg.status, msg.summary);
       return;
     }
 
     if (msg.type === "result") {
       finish();
-      card.classList.replace("running", "done");
-      state.results[index] = msg.url;
-      badge.textContent = `${taskLabel} · 完成`;
-      badge.classList.add("ok");
-      const box = document.createElement("div");
-      box.className = "job-result";
-      box.innerHTML = `
-        <img class="job-thumb" src="${msg.url}" alt="第 ${index + 1} 张生成结果"
-             role="button" tabindex="0" title="点击放大查看"
-             aria-label="放大查看第 ${index + 1} 张生成结果" />
-        <p class="job-result-note">已暂存第 ${index + 1} 张 · 点击图片可放大查看。${msg.status || ""}</p>`;
-      card.appendChild(box);
-      nextJob();
+      finishJob(card, badge, index, taskLabel, msg.url, msg.status);
       return;
     }
 
@@ -389,7 +469,7 @@ function buildBook() {
   const sheets = [
     {
       front: { cls: "page-cover", html: `
-        <img class="page-art" src="/static/assets/cover.png" alt="封面"
+        <img class="page-art" src="assets/cover.png" alt="封面"
              onerror="this.remove()" />
         <div class="cover-title">我的奇妙绘本</div>
         <div class="cover-sub">AI STORYBOOK</div>` },
@@ -408,7 +488,7 @@ function buildBook() {
           html: pagePhotoHTML(photos[photos.length - 1], photos.length) }
       : { cls: "page-lining", html: `<div class="lining-note">THE END</div>` },
     back: { cls: "page-cover", html: `
-        <img class="page-art" src="/static/assets/back_cover.png" alt="封底"
+        <img class="page-art" src="assets/back_cover.png" alt="封底"
              onerror="this.remove()" />
         <div class="cover-sub">GOOD NIGHT · SEE YOU NEXT STORY</div>` },
   });
